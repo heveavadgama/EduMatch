@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 from sklearn.preprocessing import normalize
 
 # ---------- Config ----------
-DATA_PATH = "/content/drive/MyDrive/NLP_RS/extracted/coursea_data.csv"  # update if needed
+DATA_PATH = "/content/drive/MyDrive/NLP_RS/extracted/coursera_data.csv"  # update if needed
 EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
 
 # ---------- Utilities ----------
