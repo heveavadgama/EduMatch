@@ -1,30 +1,40 @@
 # app.py
+"""
+Faster-start Course Recommender (single-file)
+Place coursea_data.csv in repo root. Optional: commit course_embeddings.npy for instant startup.
 
+Run:
+    pip install -r requirements.txt
+    streamlit run app.py
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
 import re
 from pathlib import Path
 from sklearn.preprocessing import normalize
+import os
 
-# Import SentenceTransformer lazily to avoid startup errors in environments without torch yet.
+# try lazy import to show clearer errors
 try:
     from sentence_transformers import SentenceTransformer
 except Exception:
-    SentenceTransformer = None  # will import later when needed
+    SentenceTransformer = None
 
 # ---------- Config ----------
-DATA_FILE = "coursera_data.csv"   # expected in repo root
-EMBED_MODEL_NAME = "all-MiniLM-L6-v2"
+DATA_FILE = "coursea_data.csv"
+EMBED_FILE = "course_embeddings.npy"   # recommended to commit to repo for instant start
+EMBED_MODEL_NAME = "paraphrase-MiniLM-L3-v2"  # smaller & faster than all-MiniLM-L6-v2
+MAX_ROWS_FOR_QUICK_START = 500  # set None to use full dataset
 
-# ---------- Minimal stopwords for speed ----------
+# ---------- Minimal stopwords ----------
 _SIMPLE_STOPWORDS = {
     "the", "and", "a", "an", "of", "in", "for", "to", "with", "on", "by", "from",
     "is", "are", "course", "specialization", "introduction", "intro",
     "beginner", "intermediate", "advanced"
 }
 
-# ---------- Utility functions ----------
+# ---------- Helpers ----------
 def parse_enrollment(x):
     if pd.isna(x):
         return np.nan
@@ -46,55 +56,57 @@ def clean_text_raw(text: str) -> str:
     tokens = [t for t in tokens if t not in _SIMPLE_STOPWORDS]
     return " ".join(tokens)
 
-# ---------- Data loading / preprocessing ----------
+# ---------- Data loader ----------
 @st.cache_data(show_spinner=False)
-def load_dataframe(path: str) -> pd.DataFrame:
+def load_dataframe(path: str, max_rows=None) -> pd.DataFrame:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"CSV not found at {p.resolve()}. Add {p.name} to repo root.")
     df = pd.read_csv(p)
-    # standardize column names
+    if max_rows:
+        df = df.head(max_rows).copy()
     df.columns = [c.strip() for c in df.columns]
-    # parse enrollment and rating safely
-    if 'course_students_enrolled' in df.columns:
-        df['students_enrolled_num'] = df['course_students_enrolled'].apply(parse_enrollment)
-    else:
-        df['students_enrolled_num'] = np.nan
-    if 'course_rating' in df.columns:
-        df['course_rating'] = pd.to_numeric(df['course_rating'], errors='coerce')
-    else:
-        df['course_rating'] = np.nan
-    # ensure course_difficulty is string
-    if 'course_difficulty' in df.columns:
-        df['course_difficulty'] = df['course_difficulty'].astype(str).replace('nan', '')
-    else:
-        df['course_difficulty'] = ''
-    # combine textual fields into text_data
+    df['students_enrolled_num'] = df.get('course_students_enrolled', pd.Series([np.nan]*len(df))).apply(parse_enrollment)
+    df['course_rating'] = pd.to_numeric(df.get('course_rating', pd.Series([np.nan]*len(df))), errors='coerce')
+    df['course_difficulty'] = df.get('course_difficulty','').astype(str).replace('nan','')
     df['text_data'] = (
-        df.get('course_title', '').fillna('') + ' ' +
-        df.get('course_organization', '').fillna('') + ' ' +
-        df.get('course_Certificate_type', '').fillna('') + ' ' +
+        df.get('course_title','').fillna('') + ' ' +
+        df.get('course_organization','').fillna('') + ' ' +
+        df.get('course_Certificate_type','').fillna('') + ' ' +
         df['course_difficulty'].fillna('')
     )
     df['clean_text'] = df['text_data'].apply(clean_text_raw)
     df = df.reset_index(drop=True)
     return df
 
-# ---------- Embedding model and embeddings ----------
+# ---------- Embedding loader / builder ----------
 @st.cache_resource(show_spinner=False)
-def load_encoder_and_embeddings(df: pd.DataFrame):
+def get_encoder_and_embeddings(df: pd.DataFrame, embed_file: str, model_name: str):
+    # Try load precomputed embeddings
+    if os.path.exists(embed_file):
+        emb = np.load(embed_file)
+        # ensure shape matches df length; if mismatch, ignore file
+        if emb.shape[0] == len(df):
+            emb_norm = normalize(np.array(emb), axis=1, norm='l2')
+            return None, emb_norm  # model is None because we only load embeddings
+        # else fallthrough to recompute
+    # Compute embeddings (download model once)
     global SentenceTransformer
     if SentenceTransformer is None:
-        # import here to surface clearer error messages if missing
         from sentence_transformers import SentenceTransformer as ST
         SentenceTransformer = ST
-    model = SentenceTransformer(EMBED_MODEL_NAME)
+    model = SentenceTransformer(model_name)
     texts = df['clean_text'].astype(str).tolist()
-    emb = model.encode(texts, show_progress_bar=False)
+    emb = model.encode(texts, show_progress_bar=True)
     emb_norm = normalize(np.array(emb), axis=1, norm='l2')
+    # Save to disk for future fast startups
+    try:
+        np.save(embed_file, emb_norm)
+    except Exception:
+        pass
     return model, emb_norm
 
-# ---------- Recommendation utilities ----------
+# ---------- Recommendation utils ----------
 def top_k_from_sim(sim_vec: np.ndarray, k: int = 5, exclude_idx=None):
     sim = sim_vec.copy()
     if exclude_idx is not None:
@@ -109,6 +121,13 @@ def recommend_by_index(idx: int, emb_norm: np.ndarray, df: pd.DataFrame, k: int 
 
 def recommend_by_text(query: str, model, emb_norm: np.ndarray, df: pd.DataFrame, k: int = 5):
     q_clean = clean_text_raw(query)
+    # if model is None then embeddings were preloaded; load small model just for query encoding
+    if model is None:
+        global SentenceTransformer
+        if SentenceTransformer is None:
+            from sentence_transformers import SentenceTransformer as ST
+            SentenceTransformer = ST
+        model = SentenceTransformer(EMBED_MODEL_NAME)
     q_emb = model.encode([q_clean])
     q_emb_n = q_emb / np.linalg.norm(q_emb, axis=1, keepdims=True)
     sim = emb_norm.dot(q_emb_n[0])
@@ -130,63 +149,64 @@ def format_results(idxs, scores, df):
     return out
 
 # ---------- Streamlit UI ----------
-st.set_page_config(page_title="Course Recommender", layout="wide")
-st.title("Content-based Course Recommender (single-file)")
+st.set_page_config(page_title="Course Recommender (fast start)", layout="wide")
+st.title("Content-based Course Recommender — Faster Startup")
 
 st.markdown(
-    "This app builds sentence-transformer embeddings from course text and "
-    "returns nearest courses by cosine similarity. Put `coursea_data.csv` in the repo root."
+    "This app prefers a precomputed `course_embeddings.npy` in the repo root. "
+    "If absent it computes a smaller model embeddings (`paraphrase-MiniLM-L3-v2`) and saves them."
 )
 
-# Load dataframe
+# Controls
+use_sample = st.sidebar.checkbox(f"Limit to first {MAX_ROWS_FOR_QUICK_START} rows for faster start", value=True)
+compute_now = st.sidebar.button("Force (re)compute embeddings now")
+k = st.sidebar.slider("Top K", 1, 10, 5)
+mode = st.sidebar.radio("Mode", ["By example course", "By text query"])
+
+# Load data
+max_rows = MAX_ROWS_FOR_QUICK_START if use_sample else None
 with st.spinner("Loading dataset..."):
     try:
-        df = load_dataframe(DATA_FILE)
+        df = load_dataframe(DATA_FILE, max_rows=max_rows)
         st.success(f"Loaded {len(df)} courses.")
     except Exception as e:
         st.error(f"Failed to load dataset: {e}")
         st.stop()
 
-# Optional sample and stats
-if st.checkbox("Show sample data and stats"):
-    cols = ['course_title', 'course_organization', 'course_rating', 'course_difficulty', 'students_enrolled_num']
-    available = [c for c in cols if c in df.columns]
-    st.dataframe(df[available].head(10))
-    st.write("Rating summary")
-    st.write(df['course_rating'].describe())
+# Load or compute embeddings
+with st.spinner("Loading/creating embeddings (fast path)..."):
+    try:
+        model, emb_norm = get_encoder_and_embeddings(df, EMBED_FILE, EMBED_MODEL_NAME)
+        if os.path.exists(EMBED_FILE) and model is None:
+            st.info("Loaded precomputed embeddings from disk. Model not loaded.")
+        else:
+            st.info("Computed embeddings using smaller model and saved to disk for future startups.")
+    except Exception as e:
+        st.error(f"Embedding step failed: {e}")
+        st.stop()
 
-# Compute embeddings button (to avoid auto-running heavy download)
-if st.button("Compute embeddings now (model download may occur once)"):
-    with st.spinner("Loading embedding model and computing embeddings..."):
+# Option to force recompute (overwrite)
+if compute_now:
+    with st.spinner("Forcing recompute of embeddings..."):
         try:
-            model, emb_norm = load_encoder_and_embeddings(df)
-            st.success("Embeddings computed.")
+            # remove existing file then recompute
+            if os.path.exists(EMBED_FILE):
+                os.remove(EMBED_FILE)
+            model, emb_norm = get_encoder_and_embeddings(df, EMBED_FILE, EMBED_MODEL_NAME)
+            st.success("Recomputed and saved embeddings.")
         except Exception as e:
-            st.error(f"Failed to load model or compute embeddings: {e}")
+            st.error(f"Failed to recompute: {e}")
             st.stop()
-else:
-    model = None
-    emb_norm = None
 
-# Sidebar controls
-mode = st.sidebar.radio("Recommendation mode", ["By example course", "By text query"])
-k = st.sidebar.slider("Number of recommendations (k)", 1, 10, 5)
-
+# UI actions
 if mode == "By example course":
-    st.sidebar.markdown("Pick one example course to find similar courses.")
+    st.sidebar.markdown("Pick a course example")
     course_list = df['course_title'].astype(str).tolist()
-    selection = st.sidebar.selectbox("Select course", options=["-- pick --"] + course_list)
-    if selection != "-- pick --":
-        idx = df.index[df['course_title'].astype(str) == selection][0]
+    sel = st.sidebar.selectbox("Select course", options=["-- pick --"] + course_list)
+    if sel != "-- pick --":
+        idx = df.index[df['course_title'].astype(str) == sel][0]
         st.subheader("Selected course")
         st.write(df.loc[idx, ['course_title', 'course_organization', 'course_rating', 'course_difficulty']])
-        if model is None or emb_norm is None:
-            with st.spinner("Loading model and computing embeddings..."):
-                try:
-                    model, emb_norm = load_encoder_and_embeddings(df)
-                except Exception as e:
-                    st.error(f"Failed to load model: {e}")
-                    st.stop()
         with st.spinner("Computing recommendations..."):
             recs = recommend_by_index(int(idx), emb_norm, df, k=k)
         st.subheader("Top recommendations")
@@ -198,21 +218,14 @@ else:
     st.sidebar.markdown("Type a short query describing what you want to learn.")
     query = st.sidebar.text_area("Query", height=120, placeholder="e.g., beginner python for data analysis")
     if st.sidebar.button("Recommend from query") and query.strip():
-        if model is None or emb_norm is None:
-            with st.spinner("Loading model and computing embeddings..."):
-                try:
-                    model, emb_norm = load_encoder_and_embeddings(df)
-                except Exception as e:
-                    st.error(f"Failed to load model: {e}")
-                    st.stop()
-        with st.spinner("Encoding query and retrieving recommendations..."):
+        with st.spinner("Encoding query and retrieving..."):
             recs = recommend_by_text(query, model, emb_norm, df, k=k)
         st.subheader("Top recommendations for your query")
         for r in recs:
             st.markdown(f"**{r['course_title']}**  \nOrg: {r['organization']}  \nRating: {r['rating']}  \nDifficulty: {r['difficulty']}  \nScore: {r['score']:.3f}")
             st.write("---")
 
-st.sidebar.markdown("## Notes")
-st.sidebar.write("- This single-file app computes embeddings at runtime and does not persist model files.")
-st.sidebar.write(f"- Embedding model: {EMBED_MODEL_NAME}")
-st.sidebar.write("- If deploying on Streamlit Cloud or similar, ensure the instance has enough memory. Consider using a sampled CSV for faster startup.")
+st.sidebar.markdown("## Deployment notes")
+st.sidebar.write("- For instant startup commit `course_embeddings.npy` to repo.")
+st.sidebar.write("- Smaller embedding model used for faster load.")
+st.sidebar.write("- Sample dataset enabled by default for quicker demos.")
