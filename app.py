@@ -22,7 +22,7 @@ except Exception:
     SentenceTransformer = None
 
 # ---------- Config ----------
-DATA_FILE = "coursea_data.csv"
+DATA_FILE = "coursera_data.csv"
 EMBED_FILE = "course_embeddings.npy"   # recommended to commit to repo for instant start
 EMBED_MODEL_NAME = "paraphrase-MiniLM-L3-v2"  # smaller & faster than all-MiniLM-L6-v2
 MAX_ROWS_FOR_QUICK_START = 500  # set None to use full dataset
