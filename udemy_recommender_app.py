@@ -214,19 +214,19 @@ def device_fit(df: pd.DataFrame, device: str) -> np.ndarray:
 
 
 def difficulty_guard(df: pd.DataFrame, user_skill: str, strict: bool = True) -> np.ndarray:
+    if not strict:
+        return np.ones(len(df))
     us = {"Beginner": 0, "Intermediate": 1, "Advanced": 2}.get(user_skill, 1)
     lv = df["level_num"].to_numpy()
-    if strict:
-        # Never show courses below user's level when Advanced; never show Beginner to Intermediate+.
+    lvl_str = df["level"].astype(str).str.lower().fillna("")
+    allow_all = lvl_str.str.contains("all").to_numpy()  # always allowed
+    if us >= 2:  # Advanced
+        mask = ((lv >= 1) | allow_all).astype(float)  # allow Intermediate, Expert, and All Levels
+    elif us == 1:  # Intermediate
+        mask = ((lv >= 0.5) | allow_all).astype(float)  # block pure Beginner unless All Levels
+    else:
         mask = np.ones(len(df))
-        if us >= 2:
-            mask = (lv >= 1).astype(float)  # allow Intermediate and Expert only
-        elif us == 1:
-            mask = (lv >= 0.5).astype(float)  # block pure Beginner
-        else:
-            mask = np.ones(len(df))
-        return mask
-    return np.ones(len(df))
+    return mask
 
 
 def hybrid_score(
@@ -251,7 +251,7 @@ def hybrid_score(
     dev = device_fit(df, device)
     base = a * sim + b * pop + c * dur + d * dev
     # difficulty guard
-    guard = difficulty_guard(df, user_skill, strict=True)
+    guard = difficulty_guard(df, user_skill, strict=strict_gate)
     base = base * guard
     # bandit adjustment: add UCB score per item via simple dot of item meta with context
     # item meta: [level_num, log_duration, log_lectures, bias]
@@ -283,7 +283,7 @@ with st.sidebar:
     pref_time = st.selectbox("Preferred study time", ["Morning", "Evening"], index=0)
     query = st.text_input("Interests/keywords", value="python data analysis pandas")
     k = st.slider("How many recommendations", 5, 30, 10)
-    st.markdown("Strict difficulty gating is ON to avoid beginner drift for advanced users.")
+    strict_gate = st.checkbox("Strict difficulty gating", value=True, help="Blocks Beginner items for Intermediate+ and blocks below-Intermediate for Advanced. 'All Levels' always allowed.")
 
 # assemble context
 ctx = encode_context(skill, hours, device, pref_time)
@@ -305,9 +305,8 @@ rank_idx = np.argsort(-scores)
 rec_idx = [i for i in rank_idx if scores[i] > 0][: 3 * k]  # take some extra before filters
 
 # final post‑filters: remove zero‑length, remove NaN titles
-mask_ok = (
-    courses.iloc[rec_idx]["title"].notna() & (courses.iloc[rec_idx]["content_duration"] > 0)
-)
+# Keep rows with non-empty titles; allow zero duration rather than dropping all
+mask_ok = courses.iloc[rec_idx]["title"].notna()
 rec_idx = list(np.array(rec_idx)[np.where(mask_ok)[0]])
 
 # Top‑K with light diversity by subject
@@ -368,7 +367,24 @@ def render_row(row: pd.Series, score: float, idx: int):
             st.experimental_rerun()
 
 if len(final) == 0:
-    st.info("No items matched after constraints. Loosen filters or lower strictness.")
+    # Backoff: relax difficulty and duration constraints automatically
+    st.warning("No items matched after constraints. Relaxing difficulty gating and duration fit.")
+    # Recompute scores with non-strict gating by forcing guard to all ones
+    # Temporarily disable strict gating for fallback
+    _strict_backup = strict_gate
+    strict_gate = False
+    scores_relaxed = hybrid_score(courses, qv, hours, device, skill, ctx, bandit)
+    # restore var for consistency
+    strict_gate = _strict_backup
+    rank_idx = np.argsort(-scores_relaxed)
+    rec_idx = [i for i in rank_idx if np.isfinite(scores_relaxed[i])][: 3 * k]
+    if len(rec_idx) == 0:
+        st.info("Still no items available. Check your CSV columns like 'title', 'level', 'content_duration'.")
+    else:
+        final = rec_idx[:k]
+        for rank, i in enumerate(final, 1):
+            r = courses.iloc[i]
+            render_row(r, float(scores_relaxed[i]), i)
 else:
     for rank, i in enumerate(final, 1):
         r = courses.iloc[i]
@@ -379,6 +395,14 @@ else:
 # ---------------------------
 with st.expander("Diagnostics"):
     st.write("Context vector:", ctx.tolist())
+    st.write("Bandit dims:", bandit.d)
+    st.write({
+        "rows": len(courses),
+        "non_null_titles": int(courses["title"].notna().sum()),
+        "levels_sample": courses["level"].dropna().astype(str).str.lower().value_counts().head(10).to_dict(),
+    })
+    st.write("Guard: Beginner items blocked for Intermediate+, unless course is 'All Levels'.")
+    st.write("Tip: Provide keywords to steer content similarity.")
     st.write("Bandit dims:", bandit.d)
     st.write("Guard: beginner filtering active when user is Intermediate or Advanced.")
     st.write("Tip: Provide keywords to steer content similarity.")
