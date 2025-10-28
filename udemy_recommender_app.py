@@ -1,339 +1,392 @@
-# context_aware_app_fixed.py
-import streamlit as st
-import pandas as pd
+"""
+Streamlit: Context‑Aware Course Recommender (Udemy)
+
+Context features: skill_level, time_availability_hours_per_week, device, preferred_study_time.
+Model: hybrid re‑ranker = content similarity (embeddings) + popularity/quality + context fit + LinUCB contextual bandit for online updates.
+Update: per‑click feedback updates LinUCB weights in‑session and saves to disk.
+Hard guardrail: do not show beginner items to advanced users by default.
+"""
+
+import os
+import json
+import math
+import pickle
+from typing import List, Tuple
+
 import numpy as np
-import re
-from pathlib import Path
-from sklearn.feature_extraction.text import TfidfVectorizer
+import pandas as pd
+from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import normalize
 
-# Lazy import placeholder for SentenceTransformer
-SentenceTransformer = None
+import streamlit as st
 
-# ---------- Config ----------
-CSV_COURSEA = "coursea_data.csv"
-CSV_UDEMY = "udemy_courses_cleaned.csv"
-EMB_FILE = "course_embeddings.npy"  # optional precomputed embeddings (for either dataset)
-TFIDF_MAX_FEATURES = 4000
+# ---------------------------
+# Config
+# ---------------------------
+st.set_page_config(page_title="Context‑Aware Udemy Recommender", layout="wide")
+st.title("Context‑Aware Course Recommender")
 
-# ---------- Helpers ----------
-def clean_text_raw(text: str) -> str:
-    text = str(text).lower()
-    text = re.sub(r'http\S+',' ', text)
-    text = re.sub(r'[^a-z0-9\s]', ' ', text)
-    return " ".join(text.split())
+DATA_CSV = "udemy_courses_cleaned.csv"  # fallback to udemy_courses.csv if not found
+EMB_MODULE = "udemy_course_embeddings"   # your local embedding helper
+STATE_DIR = ".reco_state"
+MODEL_FILE = os.path.join(STATE_DIR, "linucb.pkl")
 
-def detect_level_intent(query: str):
-    q = str(query).lower()
-    if any(w in q for w in ["advanced","expert","expert-level","pro"]):
-        return "Advanced"
-    if any(w in q for w in ["intermediate","intermediate-level"]):
-        return "Intermediate"
-    if any(w in q for w in ["beginner","intro","introduction","basic"]):
-        return "Beginner"
-    return None
+os.makedirs(STATE_DIR, exist_ok=True)
 
-def top_k_indices(arr, k=5, exclude_idx=None):
-    a = np.array(arr, copy=True)
-    if exclude_idx is not None:
-        a[exclude_idx] = -np.inf
-    idxs = np.argsort(-a)[:k]
-    return idxs
-
-# ---------- Load dataset (auto-detect udemy or coursera style) ----------
+# ---------------------------
+# Data loading
+# ---------------------------
 @st.cache_data(show_spinner=False)
-def load_df():
-    # prefer udemy cleaned if exists
-    if Path(CSV_UDEMY).exists():
-        df = pd.read_csv(CSV_UDEMY)
-    elif Path(CSV_COURSEA).exists():
-        df = pd.read_csv(CSV_COURSEA)
+def load_courses() -> pd.DataFrame:
+    path = DATA_CSV if os.path.exists(DATA_CSV) else "udemy_courses.csv"
+    df = pd.read_csv(path)
+    # Expected columns. Create if missing to avoid crashes.
+    expected = {
+        "course_id": int,
+        "title": str,
+        "url": str,
+        "price": str,
+        "num_subscribers": float,
+        "avg_rating": float,
+        "num_reviews": float,
+        "num_lectures": float,
+        "level": str,  # 'Beginner', 'Intermediate', 'Expert' or similar
+        "content_duration": float,  # hours
+        "published_timestamp": str,
+        "subject": str,
+        "description": str,
+    }
+    for col, typ in expected.items():
+        if col not in df.columns:
+            df[col] = pd.Series([np.nan] * len(df), dtype="object")
+    # simple cleanups
+    df["level"] = df["level"].fillna("Unknown")
+    df["content_duration"] = pd.to_numeric(df["content_duration"], errors="coerce").fillna(0.0)
+    df["avg_rating"] = pd.to_numeric(df["avg_rating"], errors="coerce").fillna(0.0)
+    df["num_reviews"] = pd.to_numeric(df["num_reviews"], errors="coerce").fillna(0.0)
+    df["num_subscribers"] = pd.to_numeric(df["num_subscribers"], errors="coerce").fillna(0.0)
+    df["num_lectures"] = pd.to_numeric(df["num_lectures"], errors="coerce").fillna(0.0)
+    df["description"] = df.get("description", "").fillna("")
+    df["subject"] = df.get("subject", "").fillna("")
+    if "published_timestamp" in df.columns:
+        df["published_timestamp"] = pd.to_datetime(df["published_timestamp"], errors="coerce")
     else:
-        st.error("No dataset found. Place coursea_data.csv or udemy_courses_cleaned.csv in repo root.")
-        st.stop()
-    # normalize some columns for common usage
-    df.columns = [c.strip() for c in df.columns]
-    # create clean_text if missing
-    if 'clean_text' not in df.columns:
-        df['text_data'] = (
-            df.get('course_title','').fillna('') + ' ' +
-            df.get('course_organization','').fillna('') + ' ' +
-            df.get('course_Certificate_type','').fillna('') + ' ' +
-            df.get('course_difficulty','').fillna('')
-        )
-        df['clean_text'] = df['text_data'].apply(clean_text_raw)
-    # udemy specific: ensure content_duration_hr and level_simple exist
-    if 'content_duration' in df.columns and 'content_duration_hr' not in df.columns:
-        def parse_duration(x):
-            try:
-                return float(x)
-            except:
-                return np.nan
-        df['content_duration_hr'] = df['content_duration'].apply(parse_duration)
-    if 'level_simple' not in df.columns:
-        # try to map common level column names
-        if 'course_difficulty' in df.columns:
-            df['level_simple'] = df['course_difficulty'].astype(str).replace('nan','')
-        elif 'level' in df.columns:
-            def map_level(l):
-                l = str(l).lower()
-                if 'beginner' in l: return 'Beginner'
-                if 'intermediate' in l: return 'Intermediate'
-                if 'advanced' in l: return 'Advanced'
-                if 'all' in l: return 'All'
-                return 'Unknown'
-            df['level_simple'] = df['level'].apply(map_level)
-        else:
-            df['level_simple'] = 'Unknown'
-    # fill missing display columns
-    for c in ['course_title','course_organization','course_rating']:
-        if c not in df.columns:
-            df[c] = ''
-    return df.reset_index(drop=True)
+        df["published_timestamp"] = pd.NaT
+    # difficulty mapping
+    level_map = {
+        "Beginner": 0,
+        "Beginner Level": 0,
+        "All Levels": 0.5,
+        "Intermediate": 1,
+        "Intermediate Level": 1,
+        "Expert": 2,
+        "Expert Level": 2,
+        "Advanced": 2,
+        "Unknown": 0.5,
+    }
+    df["level_num"] = df["level"].map(level_map).fillna(0.5)
+    # canonical text for embeddings
+    df["text"] = (
+        df["title"].fillna("")
+        + " \n" + df["subject"].fillna("")
+        + " \n" + df["description"].fillna("")
+    )
+    return df
 
-# ---------- Embeddings & TF-IDF ----------
+courses = load_courses()
+
+# ---------------------------
+# Embeddings
+# ---------------------------
 @st.cache_resource(show_spinner=False)
-def load_embeddings(path=EMB_FILE):
-    p = Path(path)
-    if not p.exists():
-        return None
-    emb = np.load(p)
-    # normalize
-    emb_norm = emb.astype('float32')
-    norms = np.linalg.norm(emb_norm, axis=1, keepdims=True)
-    norms[norms==0] = 1.0
-    emb_norm = emb_norm / norms
-    return emb_norm
-
-@st.cache_resource(show_spinner=False)
-def build_tfidf(df):
-    tfidf = TfidfVectorizer(max_features=TFIDF_MAX_FEATURES, stop_words='english')
-    mat = tfidf.fit_transform(df['clean_text'].astype(str))
-    return tfidf, mat
-
-@st.cache_resource(show_spinner=False)
-def load_transformer(name="paraphrase-MiniLM-L3-v2"):
-    global SentenceTransformer
-    if SentenceTransformer is None:
-        from sentence_transformers import SentenceTransformer as ST
-        SentenceTransformer = ST
-    return SentenceTransformer(name)
-
-# ---------- Scoring components ----------
-def improved_skill_score(user_skill, course_level):
-    # stricter scoring: exact match=1, adjacent=0.5, opposite=0.0
-    mapping = {'Beginner':0,'All':0,'Intermediate':1,'Advanced':2,'Unknown':1}
-    us = {'Beginner':0,'Intermediate':1,'Advanced':2}.get(user_skill,1)
-    cs = mapping.get(course_level,1)
-    dist = abs(us - cs)
-    if dist == 0:
-        return 1.0
-    if dist == 1:
-        return 0.5
-    return 0.0
-
-def time_score_continuous(user_hours_per_week, course_total_hours, expected_weeks=4):
+def load_embedder():
+    """Try to import user's helper. Fallback to simple TF‑IDF vectorizer if embeddings unavailable."""
     try:
-        ch = float(course_total_hours)
-        if np.isnan(ch) or ch <= 0:
-            return 0.5  # neutral
-        required_weekly = max(0.5, ch / expected_weeks)
-        score = user_hours_per_week / required_weekly
-        return float(max(0.0, min(1.0, score)))
-    except:
-        return 0.5
+        imp = __import__(EMB_MODULE)
+        # Expecting functions: get_course_embeddings(df) -> np.ndarray, get_query_embedding(text) -> np.ndarray
+        return imp
+    except Exception:
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        vec = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
+        vec.fit(courses["text"].tolist())
+        class _Fallback:
+            def get_course_embeddings(self, df):
+                return vec.transform(df["text"].tolist()).astype(np.float32)
+            def get_query_embedding(self, text):
+                return vec.transform([text]).astype(np.float32)
+        return _Fallback()
 
-# ---------- Main app ----------
-st.set_page_config(page_title="Context-Aware Course Recommender — Fixed", layout="wide")
-st.title("Context-Aware Course Recommender — Fixed & Hardened")
+embedder = load_embedder()
 
-df = load_df()
-emb_norm = load_embeddings()
-tfidf, tfidf_mat = build_tfidf(df)
-
-# Sidebar controls
-st.sidebar.header("User Context")
-skill_level = st.sidebar.selectbox("Your skill level", ["Beginner","Intermediate","Advanced"], index=1)
-hours_per_week = st.sidebar.slider("Available study time (hours/week)", 0.5, 40.0, 4.0, step=0.5)
-device = st.sidebar.selectbox("Device used", ["Desktop","Mobile"])
-preferred_time = st.sidebar.selectbox("Preferred study time", ["Morning","Afternoon","Evening"])
-
-st.sidebar.markdown("---")
-st.sidebar.header("Recommendation Settings")
-alpha = st.sidebar.slider("Weight on semantic similarity (alpha)", 0.0, 1.0, 0.75, step=0.05)
-use_transformer = st.sidebar.checkbox("Use Transformer for query encoding (better quality)", value=True)
-desired_level_ui = st.sidebar.selectbox("Preferred difficulty (UI override)", ["Any", "Beginner", "Intermediate", "Advanced"], index=0)
-strict_difficulty = st.sidebar.checkbox("Require difficulty match (strict filter)", value=False)
-soft_boost = st.sidebar.checkbox("Apply soft boost for preferred difficulty", value=True)
-boost_factor = st.sidebar.slider("Difficulty boost factor (if soft)", 1.0, 2.0, 1.25, step=0.05)
-top_k = st.sidebar.slider("Top-K", 1, 20, 5)
-
-st.sidebar.markdown("---")
-st.sidebar.write("Intent detection from query is enabled. If query contains 'advanced' it will be used as preferred difficulty (unless UI override).")
-
-# UI: mode and query
-mode = st.radio("Mode", ["By text query", "By example course"])
-query = ""
-if mode == "By text query":
-    query = st.text_area("Enter your query (e.g., 'advanced python web development')", height=120)
-
-# Determine desired difficulty
-detected_level = detect_level_intent(query) if query else None
-desired_level = desired_level_ui if desired_level_ui != "Any" else (detected_level or None)
-
-# Helper: semantic similarity functions
-def semantic_sim_by_query(query_text):
-    q = clean_text_raw(query_text)
-    if use_transformer and emb_norm is not None:
-        # lazy-load model
+@st.cache_data(show_spinner=False)
+def get_course_embeddings() -> np.ndarray:
+    embs = embedder.get_course_embeddings(courses)
+    # ensure dense matrix
+    if not isinstance(embs, np.ndarray):
         try:
-            model = load_transformer()
-            q_emb = model.encode([q])
-            q_emb_n = q_emb / np.linalg.norm(q_emb, axis=1, keepdims=True)
-            sims = emb_norm.dot(q_emb_n[0])
-            sims = np.clip(sims, 0.0, 1.0)
-            return sims
-        except Exception as e:
-            # fallback to TF-IDF
-            st.warning(f"Transformer encoding failed, falling back to TF-IDF. ({e})")
-    # TF-IDF fallback
-    qv = tfidf.transform([q])
-    sims = cosine_similarity(qv, tfidf_mat).ravel()
-    mn, mx = sims.min(), sims.max()
-    if mx - mn < 1e-9:
-        return np.zeros_like(sims)
-    return (sims - mn) / (mx - mn)
+            embs = embs.toarray()
+        except Exception:
+            embs = np.asarray(embs)
+    # L2 norm guard
+    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-8
+    return embs / norms
 
-def semantic_sim_by_index(idx):
-    if emb_norm is not None:
-        sims = emb_norm.dot(emb_norm[idx])
-        return np.clip(sims, 0.0, 1.0)
-    else:
-        v = tfidf_mat[idx]
-        sims = cosine_similarity(v, tfidf_mat).ravel()
-        mn, mx = sims.min(), sims.max()
-        if mx - mn < 1e-9:
-            return np.zeros_like(sims)
-        return (sims - mn) / (mx - mn)
+COURSE_EMB = get_course_embeddings()
 
-# Prepare per-course context base scores
-def compute_context_scores(user_ctx):
-    # returns numpy array of context scores in [0,1]
-    skill_arr = np.array([improved_skill_score(user_ctx['skill_level'], lvl) for lvl in df['level_simple']])
-    # time scores: use content_duration_hr if present else neutral
-    if 'content_duration_hr' in df.columns:
-        time_arr = np.array([time_score_continuous(user_ctx['hours_per_week'], h) for h in df['content_duration_hr'].fillna(np.nan)])
-    else:
-        time_arr = np.array([0.5]*len(df))
-    # device score: basic heuristic
-    title_lower = df['course_title'].astype(str).str.lower()
-    mobile_friendly = np.where(title_lower.str.contains('mobile|app|responsive'), 1.0, 0.95)
-    device_arr = np.where(user_ctx['device'].lower()=="mobile", mobile_friendly, 1.0)
-    # combine with weights
-    w_skill, w_time, w_device = 0.5, 0.3, 0.2
-    combined = w_skill*skill_arr + w_time*time_arr + w_device*device_arr
-    # clip
-    combined = np.clip(combined, 0.0, 1.0)
-    return combined, {'skill':skill_arr, 'time':time_arr, 'device':device_arr}
+# ---------------------------
+# LinUCB contextual bandit (lightweight)
+# ---------------------------
+class LinUCB:
+    def __init__(self, d: int, alpha: float = 0.2):
+        self.d = d
+        self.alpha = alpha
+        self.A = np.eye(d)
+        self.b = np.zeros((d, 1))
+    def score(self, x: np.ndarray) -> float:
+        A_inv = np.linalg.inv(self.A)
+        theta = A_inv @ self.b
+        mean = float((x.T @ theta).ravel())
+        bonus = self.alpha * math.sqrt(float(x.T @ A_inv @ x))
+        return mean + bonus
+    def update(self, x: np.ndarray, reward: float):
+        x = x.reshape(-1, 1)
+        self.A += x @ x.T
+        self.b += reward * x
 
-# Candidate selection based on desired difficulty
-def candidate_indices_for_difficulty(desired_level, strict):
-    if not desired_level:
-        return np.arange(len(df))
-    mask = df['level_simple'] == desired_level
-    idxs = np.where(mask)[0]
+def load_or_init_bandit(d: int) -> LinUCB:
+    if os.path.exists(MODEL_FILE):
+        try:
+            with open(MODEL_FILE, "rb") as f:
+                obj = pickle.load(f)
+            if isinstance(obj, LinUCB) and obj.d == d:
+                return obj
+        except Exception:
+            pass
+    return LinUCB(d=d, alpha=0.2)
+
+def save_bandit(b: LinUCB):
+    with open(MODEL_FILE, "wb") as f:
+        pickle.dump(b, f)
+
+# ---------------------------
+# Context encoders
+# ---------------------------
+def encode_context(skill: str, hours_per_week: int, device: str, study_time: str) -> np.ndarray:
+    skill_map = {"Beginner": 0, "Intermediate": 1, "Advanced": 2}
+    device_map = {"Mobile": [1, 0], "Desktop": [0, 1]}
+    time_map = {"Morning": [1, 0], "Evening": [0, 1]}
+    x = [skill_map.get(skill, 1), hours_per_week]
+    x += device_map.get(device, [0, 1])
+    x += time_map.get(study_time, [1, 0])
+    return np.array(x, dtype=float)
+
+# ---------------------------
+# Scoring components
+# ---------------------------
+@st.cache_data(show_spinner=False)
+def popularity_scores(df: pd.DataFrame) -> np.ndarray:
+    cols = ["avg_rating", "num_reviews", "num_subscribers"]
+    mms = MinMaxScaler()
+    X = mms.fit_transform(df[cols].fillna(0.0))
+    pop = 0.5 * X[:, 0] + 0.3 * X[:, 1] + 0.2 * X[:, 2]
+    return pop
+
+POP = popularity_scores(courses)
+
+
+def duration_fit(df: pd.DataFrame, hours_per_week: int, horizon_weeks: int = 6) -> np.ndarray:
+    # prefer courses whose duration <= available_time * horizon, soft penalty otherwise
+    cap = max(1, hours_per_week * horizon_weeks)
+    dur = df["content_duration"].fillna(0.0).to_numpy()
+    fit = np.where(dur <= cap, 1.0, np.clip(cap / (dur + 1e-6), 0.1, 1.0))
+    return fit
+
+
+def device_fit(df: pd.DataFrame, device: str) -> np.ndarray:
+    if device == "Mobile":
+        # Prefer fewer lectures and shorter total duration on mobile
+        mms = MinMaxScaler()
+        two = mms.fit_transform(df[["num_lectures", "content_duration"]].fillna(0.0))
+        # lower is better -> invert
+        return 1.0 - 0.5 * two[:, 0] - 0.5 * two[:, 1]
+    # Desktop neutral
+    return np.ones(len(df))
+
+
+def difficulty_guard(df: pd.DataFrame, user_skill: str, strict: bool = True) -> np.ndarray:
+    us = {"Beginner": 0, "Intermediate": 1, "Advanced": 2}.get(user_skill, 1)
+    lv = df["level_num"].to_numpy()
     if strict:
-        if len(idxs) == 0:
-            # no candidates of that level, fallback to all (user can disable strict)
-            return np.arange(len(df))
-        return idxs
-    else:
-        return np.arange(len(df))  # soft handled via boosting
-
-# Apply soft boost multiplier
-def apply_difficulty_boost(final_scores, desired_level, boost_factor):
-    if not desired_level or not boost_factor or boost_factor <= 1.0:
-        return final_scores
-    mult = np.where(df['level_simple'] == desired_level, boost_factor, 1.0)
-    return final_scores * mult
-
-# Main recommendation flow
-user_ctx = {'skill_level': skill_level, 'hours_per_week': hours_per_week, 'device': device, 'preferred_time': preferred_time}
-context_scores_all, context_components = compute_context_scores(user_ctx)
-
-if mode == "By text query":
-    if st.button("Recommend"):
-        if not query.strip():
-            st.warning("Enter a query.")
+        # Never show courses below user's level when Advanced; never show Beginner to Intermediate+.
+        mask = np.ones(len(df))
+        if us >= 2:
+            mask = (lv >= 1).astype(float)  # allow Intermediate and Expert only
+        elif us == 1:
+            mask = (lv >= 0.5).astype(float)  # block pure Beginner
         else:
-            sem_sim_all = semantic_sim_by_query(query)
-            # candidate indices based on strict desired_level
-            candidate_idxs = candidate_indices_for_difficulty(desired_level, strict_difficulty)
-            # compute final for candidates
-            sem_sim = sem_sim_all[candidate_idxs]
-            context_for_candidates = context_scores_all[candidate_idxs]
-            final = alpha * sem_sim + (1.0 - alpha) * context_for_candidates
-            # apply soft boosting if enabled and desired_level set
-            if soft_boost and desired_level:
-                # apply boost factor aligned to full df then select subset
-                mult = np.where(df['level_simple'] == desired_level, boost_factor, 1.0)
-                final = final * mult[candidate_idxs]
-            # select topK within candidate set
-            top_local = np.argsort(-final)[:top_k]
-            top_global = candidate_idxs[top_local]
-            st.subheader(f"Top {top_k} results (desired: {desired_level or 'Any'})")
-            for rank, i in enumerate(top_global, start=1):
-                sscore = float(sem_sim_all[i])
-                cscore = float(context_scores_all[i])
-                fscore = float(alpha*sscore + (1-alpha)*cscore)
-                st.markdown(f"**{rank}. {df.loc[i,'course_title']}**")
-                st.write(f"Subject/Org: {df.loc[i].get('subject', df.loc[i].get('course_organization',''))}  |  Duration: {df.loc[i].get('content_duration_hr', '')}  | Level: {df.loc[i,'level_simple']}")
-                st.write(f"Semantic: {sscore:.3f}  | Context: {cscore:.3f}  | Combined: {fscore:.3f}")
-                st.write("---")
+            mask = np.ones(len(df))
+        return mask
+    return np.ones(len(df))
 
+
+def hybrid_score(
+    df: pd.DataFrame,
+    query_vec: np.ndarray,
+    hours_per_week: int,
+    device: str,
+    user_skill: str,
+    ctx_vec: np.ndarray,
+    bandit: LinUCB,
+    weights=(0.45, 0.25, 0.15, 0.15),  # content, popularity, duration, device
+) -> np.ndarray:
+    a, b, c, d = weights
+    # content similarity
+    sim = cosine_similarity(query_vec, COURSE_EMB).ravel()
+    # normalize
+    if sim.max() - sim.min() > 1e-9:
+        sim = (sim - sim.min()) / (sim.max() - sim.min())
+    # components
+    pop = POP
+    dur = duration_fit(df, hours_per_week)
+    dev = device_fit(df, device)
+    base = a * sim + b * pop + c * dur + d * dev
+    # difficulty guard
+    guard = difficulty_guard(df, user_skill, strict=True)
+    base = base * guard
+    # bandit adjustment: add UCB score per item via simple dot of item meta with context
+    # item meta: [level_num, log_duration, log_lectures, bias]
+    meta = np.stack([
+        df["level_num"].to_numpy(),
+        np.log1p(df["content_duration"].fillna(0.0).to_numpy()),
+        np.log1p(df["num_lectures"].fillna(0.0).to_numpy()),
+        np.ones(len(df)),
+    ], axis=1)
+    # build context cross features = kron(ctx, meta_i) collapsed via mean
+    # efficient: project meta with learned theta using ctx as features
+    # For simplicity, we concatenate ctx and meta and score with bandit.
+    bandit_scores = np.array([bandit.score(np.concatenate([ctx_vec, m])) for m in meta])
+    # rescale bandit scores to 0-0.2 additive bonus
+    if bandit_scores.max() - bandit_scores.min() > 1e-9:
+        band_adj = 0.2 * (bandit_scores - bandit_scores.min()) / (bandit_scores.max() - bandit_scores.min())
+    else:
+        band_adj = np.zeros_like(bandit_scores)
+    return base + band_adj
+
+# ---------------------------
+# UI
+# ---------------------------
+with st.sidebar:
+    st.header("Your Context")
+    skill = st.selectbox("Current skill level", ["Beginner", "Intermediate", "Advanced"], index=1)
+    hours = st.slider("Time availability (hours/week)", 1, 40, 6)
+    device = st.selectbox("Device used", ["Mobile", "Desktop"], index=1)
+    pref_time = st.selectbox("Preferred study time", ["Morning", "Evening"], index=0)
+    query = st.text_input("Interests/keywords", value="python data analysis pandas")
+    k = st.slider("How many recommendations", 5, 30, 10)
+    st.markdown("Strict difficulty gating is ON to avoid beginner drift for advanced users.")
+
+# assemble context
+ctx = encode_context(skill, hours, device, pref_time)
+bandit = load_or_init_bandit(d=len(ctx) + 4)  # + item meta dims
+
+# query embedding
+qv = embedder.get_query_embedding(query)
+if not isinstance(qv, np.ndarray):
+    try:
+        qv = qv.toarray()
+    except Exception:
+        qv = np.asarray(qv)
+# L2 norm
+qv = qv / (np.linalg.norm(qv, axis=1, keepdims=True) + 1e-8)
+
+# score
+scores = hybrid_score(courses, qv, hours, device, skill, ctx, bandit)
+rank_idx = np.argsort(-scores)
+rec_idx = [i for i in rank_idx if scores[i] > 0][: 3 * k]  # take some extra before filters
+
+# final post‑filters: remove zero‑length, remove NaN titles
+mask_ok = (
+    courses.iloc[rec_idx]["title"].notna() & (courses.iloc[rec_idx]["content_duration"] > 0)
+)
+rec_idx = list(np.array(rec_idx)[np.where(mask_ok)[0]])
+
+# Top‑K with light diversity by subject
+seen_subjects = set()
+final = []
+for i in rec_idx:
+    subj = str(courses.iloc[i]["subject"]).strip().lower()
+    if subj not in seen_subjects or len(final) < k // 2:
+        final.append(i)
+        seen_subjects.add(subj)
+    if len(final) >= k:
+        break
+if len(final) < k:
+    final += rec_idx[: k - len(final)]
+final = final[:k]
+
+st.subheader("Recommendations")
+
+def render_row(row: pd.Series, score: float, idx: int):
+    cols = st.columns([6, 2, 2, 2])
+    with cols[0]:
+        st.markdown(f"**{row['title']}**")
+        if isinstance(row.get("url", None), str) and row["url"].strip():
+            st.markdown(f"[Open course]({row['url']})")
+        st.caption(f"Level: {row['level']} • Subject: {row['subject']} • Duration: {row['content_duration']}h • Lectures: {int(row['num_lectures'])}")
+    with cols[1]:
+        st.metric("Rating", f"{row['avg_rating']:.2f}")
+    with cols[2]:
+        st.metric("Reviews", int(row['num_reviews']))
+    with cols[3]:
+        st.markdown(f"Score: {score:.3f}")
+    # feedback buttons
+    fb_cols = st.columns(3)
+    with fb_cols[0]:
+        if st.button("👍 Helpful", key=f"up_{idx}"):
+            x = np.concatenate([ctx, np.array([
+                row["level_num"], math.log1p(row["content_duration"]), math.log1p(row["num_lectures"]), 1.0
+            ])])
+            bandit.update(x.reshape(-1, 1), reward=1.0)
+            save_bandit(bandit)
+            st.experimental_rerun()
+    with fb_cols[1]:
+        if st.button("👎 Not for me", key=f"down_{idx}"):
+            x = np.concatenate([ctx, np.array([
+                row["level_num"], math.log1p(row["content_duration"]), math.log1p(row["num_lectures"]), 1.0
+            ])])
+            bandit.update(x.reshape(-1, 1), reward=-0.5)
+            save_bandit(bandit)
+            st.experimental_rerun()
+    with fb_cols[2]:
+        if st.button("🚫 Hide beginner drift", key=f"ban_{idx}"):
+            # extra penalty if item is below user's level
+            x = np.concatenate([ctx, np.array([
+                row["level_num"], math.log1p(row["content_duration"]), math.log1p(row["num_lectures"]), 1.0
+            ])])
+            bandit.update(x.reshape(-1, 1), reward=-1.0)
+            save_bandit(bandit)
+            st.experimental_rerun()
+
+if len(final) == 0:
+    st.info("No items matched after constraints. Loosen filters or lower strictness.")
 else:
-    # By example course
-    st.subheader("Pick an example course")
-    choice = st.selectbox("Course", ["-- pick --"] + df['course_title'].astype(str).tolist())
-    if choice != "-- pick --":
-        idx = int(df.index[df['course_title'].astype(str) == choice][0])
-        # base semantic similarity
-        sem_all = semantic_sim_by_index(idx)
-        candidate_idxs = candidate_indices_for_difficulty(desired_level, strict_difficulty)
-        sem_sim = sem_all[candidate_idxs]
-        context_for_candidates = context_scores_all[candidate_idxs]
-        final = alpha * sem_sim + (1.0 - alpha) * context_for_candidates
-        if soft_boost and desired_level:
-            mult = np.where(df['level_simple'] == desired_level, boost_factor, 1.0)
-            final = final * mult[candidate_idxs]
-        # exclude self if present
-        # map idx to candidate index position
-        if idx in candidate_idxs:
-            pos = np.where(candidate_idxs==idx)[0]
-            if len(pos)>0:
-                final[pos[0]] = -np.inf
-        top_local = np.argsort(-final)[:top_k]
-        top_global = candidate_idxs[top_local]
-        st.subheader(f"Top {top_k} similar courses (desired: {desired_level or 'Any'})")
-        for rank, i in enumerate(top_global, start=1):
-            sscore = float(sem_all[i])
-            cscore = float(context_scores_all[i])
-            fscore = float(alpha*sscore + (1-alpha)*cscore)
-            st.markdown(f"**{rank}. {df.loc[i,'course_title']}**")
-            st.write(f"Subject/Org: {df.loc[i].get('subject', df.loc[i].get('course_organization',''))}  |  Duration: {df.loc[i].get('content_duration_hr','')}  | Level: {df.loc[i,'level_simple']}")
-            st.write(f"Semantic: {sscore:.3f}  | Context: {cscore:.3f}  | Combined: {fscore:.3f}")
-            st.write("---")
+    for rank, i in enumerate(final, 1):
+        r = courses.iloc[i]
+        render_row(r, float(scores[i]), i)
 
-# Explainability panel
-st.markdown("---")
-st.subheader("Explainability & How matches were computed")
-st.write("""
-1. Semantic similarity computed by Transformer embeddings (if available) or TF-IDF as fallback.
-2. Context score computed from:
-   - Skill match (strict scoring, exact=1, adjacent=0.5, opposite=0)
-   - Time availability (continuous match using course duration if present)
-   - Device compatibility heuristic
-3. Final score = alpha * semantic + (1-alpha) * context.
-4. Difficulty preference: can be enforced strictly or applied as a soft boost multiplier.
-""")
+# ---------------------------
+# Debug and controls
+# ---------------------------
+with st.expander("Diagnostics"):
+    st.write("Context vector:", ctx.tolist())
+    st.write("Bandit dims:", bandit.d)
+    st.write("Guard: beginner filtering active when user is Intermediate or Advanced.")
+    st.write("Tip: Provide keywords to steer content similarity.")
+
+# ---------------------------
+# Notes
+# ---------------------------
+st.caption(
+    "Re‑ranking = 45% content, 25% popularity, 15% duration fit, 15% device fit + LinUCB bonus. "
+    "Advanced users will not see Beginner items by default."
+)
