@@ -131,18 +131,3 @@ Then open: **http://localhost:8501**
 - Experience with **Streamlit app deployment**.
 
 ---
-
-## 🚀 Future Enhancements
-- Integrate **Collaborative Filtering** using user feedback.
-- Add **Hybrid Recommendation** (content + collaborative).
-- Store vectors in **FAISS/Pinecone** for faster retrieval.
-- Include **explainability layer** showing why courses are recommended.
-
----
-
-## 👩‍💻 Author
-**Your Name**  
-Course: *Recommendation Systems*  
-Institution: *[Your College Name]*  
-Instructor: *[Professor’s Name]*  
-Date: *October 2025*
