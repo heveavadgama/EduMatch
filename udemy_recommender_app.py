@@ -40,9 +40,24 @@ os.makedirs(STATE_DIR, exist_ok=True)
 def load_courses() -> pd.DataFrame:
     path = DATA_CSV if os.path.exists(DATA_CSV) else "udemy_courses.csv"
     df = pd.read_csv(path)
+    # Harmonize common Udemy schemas
+    rename_map = {}
+    if "course_title" in df.columns and "title" not in df.columns:
+        rename_map["course_title"] = "title"
+    if "course_rating" in df.columns and "avg_rating" not in df.columns:
+        rename_map["course_rating"] = "avg_rating"
+    if "rating" in df.columns and "avg_rating" not in df.columns:
+        rename_map["rating"] = "avg_rating"
+    if "link" in df.columns and "url" not in df.columns:
+        rename_map["link"] = "url"
+    if "duration" in df.columns and "content_duration" not in df.columns:
+        rename_map["duration"] = "content_duration"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
     # Expected columns. Create if missing to avoid crashes.
     expected = {
-        "course_id": int,
+        "course_id": float,
         "title": str,
         "url": str,
         "price": str,
@@ -50,33 +65,38 @@ def load_courses() -> pd.DataFrame:
         "avg_rating": float,
         "num_reviews": float,
         "num_lectures": float,
-        "level": str,  # 'Beginner', 'Intermediate', 'Expert' or similar
+        "level": str,
         "content_duration": float,  # hours
         "published_timestamp": str,
         "subject": str,
         "description": str,
     }
-    for col, typ in expected.items():
+    for col in expected.keys():
         if col not in df.columns:
-            df[col] = pd.Series([np.nan] * len(df), dtype="object")
+            df[col] = np.nan
+
     # simple cleanups
     df["level"] = df["level"].fillna("Unknown")
     df["content_duration"] = pd.to_numeric(df["content_duration"], errors="coerce").fillna(0.0)
-    df["avg_rating"] = pd.to_numeric(df["avg_rating"], errors="coerce").fillna(0.0)
+    df["avg_rating"] = pd.to_numeric(df["avg_rating"], errors="coerce")
+    # some datasets miss rating entirely; keep NaN to detect later
     df["num_reviews"] = pd.to_numeric(df["num_reviews"], errors="coerce").fillna(0.0)
     df["num_subscribers"] = pd.to_numeric(df["num_subscribers"], errors="coerce").fillna(0.0)
     df["num_lectures"] = pd.to_numeric(df["num_lectures"], errors="coerce").fillna(0.0)
     df["description"] = df.get("description", "").fillna("")
     df["subject"] = df.get("subject", "").fillna("")
+
     if "published_timestamp" in df.columns:
         df["published_timestamp"] = pd.to_datetime(df["published_timestamp"], errors="coerce")
     else:
         df["published_timestamp"] = pd.NaT
+
     # difficulty mapping
     level_map = {
         "Beginner": 0,
         "Beginner Level": 0,
         "All Levels": 0.5,
+        "All": 0.5,
         "Intermediate": 1,
         "Intermediate Level": 1,
         "Expert": 2,
@@ -85,12 +105,25 @@ def load_courses() -> pd.DataFrame:
         "Unknown": 0.5,
     }
     df["level_num"] = df["level"].map(level_map).fillna(0.5)
-    # canonical text for embeddings
-    df["text"] = (
-        df["title"].fillna("")
-        + " \n" + df["subject"].fillna("")
-        + " \n" + df["description"].fillna("")
+
+    # Build canonical text from available fields
+    extra_text_cols = [c for c in ["headline", "objectives", "what_you_will_learn", "requirements"] if c in df.columns]
+    pieces = [df["title"].fillna("") , df["subject"].fillna("") , df["description"].fillna("")]
+    for c in extra_text_cols:
+        pieces.append(df[c].fillna(""))
+    df["text"] = (pieces[0] + " 
+" + pieces[1] + " 
+" + pieces[2] + (" 
+" + " 
+".join([df[c] for c in extra_text_cols]) if extra_text_cols else ""))
+
+    # Fix missing titles to avoid 'nan' in UI
+    missing_title = df["title"].isna() | (df["title"].astype(str).str.strip() == "")
+    df.loc[missing_title, "title"] = (
+        df.loc[missing_title, "subject"].fillna("Course") +
+        df.loc[missing_title, "course_id"].fillna(0).astype(int).astype(str).radd(" #")
     )
+
     return df
 
 courses = load_courses()
@@ -186,9 +219,24 @@ def encode_context(skill: str, hours_per_week: int, device: str, study_time: str
 @st.cache_data(show_spinner=False)
 def popularity_scores(df: pd.DataFrame) -> np.ndarray:
     cols = ["avg_rating", "num_reviews", "num_subscribers"]
+    X = df[cols].copy()
+    # If rating is entirely missing or NaN, drop it from scoring
+    if X["avg_rating"].isna().all():
+        X["avg_rating"] = 0.0
+        rating_weight = 0.0
+    else:
+        X["avg_rating"] = X["avg_rating"].fillna(X["avg_rating"].median())
+        rating_weight = 0.4
+    X["num_reviews"] = pd.to_numeric(X["num_reviews"], errors="coerce").fillna(0.0)
+    X["num_subscribers"] = pd.to_numeric(X["num_subscribers"], errors="coerce").fillna(0.0)
+
     mms = MinMaxScaler()
-    X = mms.fit_transform(df[cols].fillna(0.0))
-    pop = 0.5 * X[:, 0] + 0.3 * X[:, 1] + 0.2 * X[:, 2]
+    Xn = mms.fit_transform(X)
+    # adapt weights depending on rating availability
+    if rating_weight == 0:
+        pop = 0.6 * Xn[:, 1] + 0.4 * Xn[:, 2]
+    else:
+        pop = rating_weight * Xn[:, 0] + 0.35 * Xn[:, 1] + 0.25 * Xn[:, 2]
     return pop
 
 POP = popularity_scores(courses)
@@ -237,61 +285,36 @@ def hybrid_score(
     user_skill: str,
     ctx_vec: np.ndarray,
     bandit: LinUCB,
-    weights=(0.45, 0.25, 0.15, 0.15),  # content, popularity, duration, device
+    weights=None,  # choose later based on data quality
 ) -> np.ndarray:
+    # Set weights dynamically: upweight content if ratings missing
+    if weights is None:
+        w = (0.6 if pd.isna(df["avg_rating"]).all() else 0.45)
+        weights = (w, 0.25, 0.1, 0.05)
     a, b, c, d = weights
     # content similarity
     sim = cosine_similarity(query_vec, COURSE_EMB).ravel()
-    # normalize
     if sim.max() - sim.min() > 1e-9:
         sim = (sim - sim.min()) / (sim.max() - sim.min())
-    # components
     pop = POP
     dur = duration_fit(df, hours_per_week)
     dev = device_fit(df, device)
     base = a * sim + b * pop + c * dur + d * dev
-    # difficulty guard
     guard = difficulty_guard(df, user_skill, strict=strict_gate)
     base = base * guard
-    # bandit adjustment: add UCB score per item via simple dot of item meta with context
-    # item meta: [level_num, log_duration, log_lectures, bias]
+    # bandit adjustment
     meta = np.stack([
         df["level_num"].to_numpy(),
         np.log1p(df["content_duration"].fillna(0.0).to_numpy()),
         np.log1p(df["num_lectures"].fillna(0.0).to_numpy()),
         np.ones(len(df)),
     ], axis=1)
-    # build context cross features = kron(ctx, meta_i) collapsed via mean
-    # efficient: project meta with learned theta using ctx as features
-    # For simplicity, we concatenate ctx and meta and score with bandit.
     bandit_scores = np.array([bandit.score(np.concatenate([ctx_vec, m])) for m in meta])
-    # rescale bandit scores to 0-0.2 additive bonus
     if bandit_scores.max() - bandit_scores.min() > 1e-9:
         band_adj = 0.2 * (bandit_scores - bandit_scores.min()) / (bandit_scores.max() - bandit_scores.min())
     else:
         band_adj = np.zeros_like(bandit_scores)
     return base + band_adj
-
-# ---------------------------
-# UI
-# ---------------------------
-with st.sidebar:
-    st.header("Your Context")
-    skill = st.selectbox("Current skill level", ["Beginner", "Intermediate", "Advanced"], index=1)
-    hours = st.slider("Time availability (hours/week)", 1, 40, 6)
-    device = st.selectbox("Device used", ["Mobile", "Desktop"], index=1)
-    pref_time = st.selectbox("Preferred study time", ["Morning", "Evening"], index=0)
-    query = st.text_input("Interests/keywords", value="python data analysis pandas")
-    k = st.slider("How many recommendations", 5, 30, 10)
-    strict_gate = st.checkbox("Strict difficulty gating", value=True, help="Blocks Beginner items for Intermediate+ and blocks below-Intermediate for Advanced. 'All Levels' always allowed.")
-
-# assemble context
-ctx = encode_context(skill, hours, device, pref_time)
-bandit = load_or_init_bandit(d=len(ctx) + 4)  # + item meta dims
-
-# query embedding
-qv = embedder.get_query_embedding(query)
-if not isinstance(qv, np.ndarray):
     try:
         qv = qv.toarray()
     except Exception:
@@ -302,7 +325,17 @@ qv = qv / (np.linalg.norm(qv, axis=1, keepdims=True) + 1e-8)
 # score
 scores = hybrid_score(courses, qv, hours, device, skill, ctx, bandit)
 rank_idx = np.argsort(-scores)
-rec_idx = [i for i in rank_idx if scores[i] > 0][: 3 * k]  # take some extra before filters
+# Optional hard keyword filter
+if require_match:
+    tokens = [t.strip().lower() for t in query.split() if t.strip()]
+    text_series = courses["text"].astype(str).str.lower()
+    kw_mask = np.zeros(len(courses), dtype=bool)
+    for t in tokens:
+        kw_mask |= text_series.str.contains(r"" + pd.regex.escape(t) + r"", regex=True)
+    candidate_idx = [i for i in rank_idx if kw_mask[i]]
+else:
+    candidate_idx = rank_idx.tolist()
+rec_idx = [i for i in candidate_idx if np.isfinite(scores[i])][: 3 * k]  # take some extra before filters
 
 # final post‑filters: remove zero‑length, remove NaN titles
 # Keep rows with non-empty titles; allow zero duration rather than dropping all
@@ -328,12 +361,17 @@ st.subheader("Recommendations")
 def render_row(row: pd.Series, score: float, idx: int):
     cols = st.columns([6, 2, 2, 2])
     with cols[0]:
-        st.markdown(f"**{row['title']}**")
-        if isinstance(row.get("url", None), str) and row["url"].strip():
+        ttl = str(row['title']) if str(row['title']).strip() else f"Course #{int(row.get('course_id', idx))}"
+        st.markdown(f"**{ttl}**")
+        if isinstance(row.get("url", None), str) and str(row["url"]).strip():
             st.markdown(f"[Open course]({row['url']})")
         st.caption(f"Level: {row['level']} • Subject: {row['subject']} • Duration: {row['content_duration']}h • Lectures: {int(row['num_lectures'])}")
     with cols[1]:
-        st.metric("Rating", f"{row['avg_rating']:.2f}")
+        rating_val = row.get('avg_rating')
+        if pd.isna(rating_val) or float(rating_val) == 0.0:
+            st.metric("Rating", "—")
+        else:
+            st.metric("Rating", f"{float(rating_val):.2f}")
     with cols[2]:
         st.metric("Reviews", int(row['num_reviews']))
     with cols[3]:
