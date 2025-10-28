@@ -124,7 +124,7 @@ def recommend_by_text_tfidf(query, tfidf_mat, tfidf, df, k=5):
 
 # ---------- App UI ----------
 st.set_page_config(page_title="Course Recommender (Transformer Queries)", layout="wide")
-st.title("Course Recommender — transformer for text queries")
+st.title("EduMatch-Course Recommender")
 
 df = load_data()
 emb_norm = load_embeddings()
@@ -172,6 +172,4 @@ else:
             st.markdown(f"**{r['course_title']}**  \nOrg: {r['org']}  \nRating: {r['rating']}  \nScore: {r['score']:.3f}")
             st.write("---")
 
-st.sidebar.markdown("### Notes")
-st.sidebar.write("- Transformer queries give better semantic matches but the model downloads on first use.")
-st.sidebar.write("- Precomputed embeddings are used for course->course similarity to keep that flow instant.")
+
