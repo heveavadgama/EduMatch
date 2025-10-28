@@ -1,18 +1,7 @@
-# Core
-pandas==2.2.2
-numpy==1.26.4
-scikit-learn==1.5.0
-
-# NLP & Embeddings
+streamlit==1.39.0
+pandas==2.2.3
+numpy==2.1.2
+scikit-learn==1.5.2
 sentence-transformers==3.0.1
-nltk==3.9.1
-
-# Visualization
-matplotlib==3.9.0
-seaborn==0.13.2
-
-# Web App
-streamlit==1.37.0
-
-# Optional (to avoid warnings in notebooks)
+torch==2.4.1
 tqdm==4.66.4
