@@ -136,7 +136,6 @@ tfidf, X, popularity = build_features(df)
 # ---------- Sidebar: context and filters ----------
 with st.sidebar:
     st.header("Context")
-    level = st.selectbox("Current skill level", LEVELS, index=0)
     hours = st.slider("Time availability (hours/week)", 1, 30, 6)
     device = st.radio("Device", ["desktop","mobile"], horizontal=True, index=0)
     study_time = st.radio("Preferred study time", ["morning","evening","any"], horizontal=True, index=2)
