@@ -66,15 +66,26 @@ def build_features(df: pd.DataFrame):
     return tfidf, X, popularity
 
 LEVELS = ["Beginner","Intermediate","Advanced","Unknown"]
-
+# --- stronger context ---
 def context_score(df, cand_idx, level, hours_per_week, device, study_time):
     lvl_match = (df.loc[cand_idx, "level"].str.lower() == level.lower()).astype(float).values
-    desired_months = np.clip(hours_per_week/5.0, 0.5, 6)
+
+    desired_months = np.clip(hours_per_week/4.0, 0.5, 9)  # tighter mapping
     dur = df.loc[cand_idx, "duration_months"].values
-    dur_fit = np.exp(-((dur - desired_months)**2) / (2*(1.5**2)))
-    dev_pen = 0.05 * (dur / (dur.max() + 1e-9)) if device == "mobile" else 0.0
-    base = 0.15*dur_fit + 0.08*lvl_match - dev_pen
-    return np.clip(base, 0, 1)
+    dur_fit = np.exp(-((dur - desired_months)**2) / (2*(1.0**2)))  # narrower peak
+
+    dev_pen = 0.0
+    if device == "mobile":
+        # penalize long programs more aggressively on mobile
+        dur_norm = (dur - dur.min()) / (dur.max() - dur.min() + 1e-9)
+        dev_pen = 0.15 * dur_norm
+
+    # study_time still neutral without logs; keep tiny jitter to break ties
+    jitter = 1e-6 * np.random.randn(len(dur))
+
+    # weights: duration fit dominates context, then level, then device penalty
+    ctx = 0.6*dur_fit + 0.3*lvl_match - dev_pen + jitter
+    return np.clip(ctx, 0, 1)
 
 def recommend(df, tfidf, X, popularity, query_skills, level, hours_per_week, device, study_time, top_k, level_filters, min_rating):
     mask = df["rating"] >= float(min_rating)
@@ -88,14 +99,23 @@ def recommend(df, tfidf, X, popularity, query_skills, level, hours_per_week, dev
     else:
         sim = np.zeros(len(cand_idx))
 
-    base = 0.7*sim + 0.3*popularity[cand_idx]
+    # normalize sim and popularity per candidate set
+    sim = (sim - sim.min()) / (sim.max() - sim.min() + 1e-9)
+    pop_c = popularity[cand_idx]
+    pop_c = (pop_c - pop_c.min()) / (pop_c.max() - pop_c.min() + 1e-9)
+
     ctx = context_score(df, cand_idx, level, hours_per_week, device, study_time)
-    score = 0.7*base + 0.3*ctx
+
+    # stronger context blend
+    score = 0.45*sim + 0.20*pop_c + 0.35*ctx
 
     order_local = np.argsort(-score)[:top_k]
     order = cand_idx[order_local]
     out = df.loc[order, ["partner","course","level","rating","reviewcount_num","duration_months","certificatetype","skills_list"]].copy()
     out.insert(0, "score", score[order_local])
+    out.insert(1, "ctx", ctx[order_local])
+    out.insert(2, "sim", sim[order_local])
+    out.insert(3, "pop", pop_c[order_local])
     return out.reset_index(drop=True)
 
 # ---------- UI: data source ----------
