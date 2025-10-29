@@ -313,9 +313,18 @@ else:
 # Diagnostics
 # ---------------------------
 with st.expander("Diagnostics"):
+    level_counts = (
+        courses["level"]
+        .dropna()
+        .astype(str)
+        .str.lower()
+        .value_counts()
+        .head(10)              # limit here
+        .to_dict()
+    )
     st.write({
         "rows": len(courses),
         "non_null_titles": int(courses["title"].astype(str).str.strip().ne("").sum()),
-        "levels": courses["level"].dropna().astype(str).str.lower().value_counts().to_dict()[:10],
-        "ratings_missing_all": bool(courses["avg_rating"].isna().all())
+        "levels": level_counts,
+        "ratings_missing_all": bool(courses["avg_rating"].isna().all()),
     })
