@@ -150,19 +150,28 @@ with st.sidebar:
 tab1, tab2 = st.tabs(["🔎 Recommendations", "📊 EDA"])
 
 with tab1:
-    res = recommend(df, tfidf, X, popularity, query, level, hours, device, study_time, top_k, level_filters, min_rating)
+    res = recommend(df, tfidf, X, popularity, query, "Unknown", hours, device, study_time, top_k, level_filters, min_rating)
     if res.empty:
         st.warning("No matches for current filters.")
     else:
         st.subheader("Recommended for you")
+        st.caption(
+            """
+            **Score meaning**  
+            • **score** → Final weighted value combining similarity, popularity, and context.  
+            • **sim** → Skill and keyword match strength.  
+            • **pop** → Popularity based on ratings and review count.  
+            • **ctx** → Fit with your current situation (time, device).  
+            """
+        )
         st.dataframe(res, use_container_width=True)
 
-        # Cards
+        # Cards view
         st.divider()
         st.subheader("Cards")
         for i, row in res.iterrows():
             with st.container(border=True):
-                c1, c2 = st.columns([5,2])
+                c1, c2 = st.columns([5, 2])
                 with c1:
                     st.markdown(f"**{row['course']}**  \n{row['partner']} • {row['level']} • {row['certificatetype']}")
                     st.markdown(
@@ -172,7 +181,10 @@ with tab1:
                     if skills:
                         st.caption(f"Skills: {skills}")
                 with c2:
-                    st.metric("Context score", f"{row['score']:.2f}")
+                    st.metric("Final score", f"{row['score']:.2f}")
+                    st.text(f"ctx={row['ctx']:.2f}")
+                    st.text(f"sim={row['sim']:.2f}")
+                    st.text(f"pop={row['pop']:.2f}")
 
 with tab2:
     c1, c2 = st.columns(2)
