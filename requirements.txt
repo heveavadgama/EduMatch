@@ -1,6 +1,6 @@
-streamlit
-pandas
-numpy
-scikit-learn
-sentence-transformers
-torch
+streamlit>=1.36
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+altair>=5.0
+joblib>=1.3
